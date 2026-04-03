@@ -1,7 +1,8 @@
 streamlit
 pandas
 numpy
-matplotlib
 scikit-learn
 joblib
-plotly
+scipy
+folium
+streamlit-folium

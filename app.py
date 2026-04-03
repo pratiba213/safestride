@@ -1,243 +1,162 @@
-import os
-import math
-import random
-from datetime import datetime
-
-import joblib
 import pandas as pd
 import streamlit as st
-import pydeck as pdk
-from sklearn.ensemble import RandomForestClassifier
-
-DATA_FILE = "events_dataset.csv"
-MODEL_FILE = "risk_model.pkl"
-
-RISK_LABELS = ["safe", "warning", "emergency"]
-RISK_TO_SCORE = {"safe": 1, "warning": 2, "emergency": 3}
-SCORE_TO_RISK = {1: "safe", 2: "warning", 3: "emergency"}
-
-FEATURE_COLUMNS = [
-    "heel_tap_count",
-    "fall_detected",
-    "gps_risk_zone",
-    "is_night",
-    "battery_low",
-    "user_moving_fast",
-    "hour",
-]
-
-ALL_COLUMNS = FEATURE_COLUMNS + ["latitude", "longitude", "risk_level"]
+import folium
+from folium.plugins import HeatMap, MarkerCluster
+from streamlit_folium import st_folium
+import joblib
+from datetime import datetime
+from scipy.sparse import hstack
 
 
-def create_seed_dataset(n=120):
-    rows = []
-    base_lat = 13.0827
-    base_lon = 80.2707
-
-    for _ in range(n):
-        hour = random.randint(0, 23)
-        is_night = 1 if hour >= 19 or hour <= 5 else 0
-        heel_tap_count = random.randint(0, 3)
-        fall_detected = random.randint(0, 1)
-        gps_risk_zone = random.choices([0, 1, 2], weights=[4, 3, 3])[0]
-        battery_low = random.choices([0, 1], weights=[8, 2])[0]
-        user_moving_fast = random.choices([0, 1], weights=[6, 4])[0]
-
-        score = 0
-        score += heel_tap_count * 1.2
-        score += fall_detected * 3.0
-        score += gps_risk_zone * 1.5
-        score += is_night * 1.0
-        score += battery_low * 0.5
-        score += user_moving_fast * 1.0
-
-        if score >= 6:
-            risk_level = "emergency"
-        elif score >= 3:
-            risk_level = "warning"
-        else:
-            risk_level = "safe"
-
-        lat = base_lat + random.uniform(-0.03, 0.03)
-        lon = base_lon + random.uniform(-0.03, 0.03)
-
-        rows.append([
-            heel_tap_count,
-            fall_detected,
-            gps_risk_zone,
-            is_night,
-            battery_low,
-            user_moving_fast,
-            hour,
-            lat,
-            lon,
-            risk_level,
-        ])
-
-    return pd.DataFrame(rows, columns=ALL_COLUMNS)
+st.set_page_config(page_title="SafeStride Heatmap", layout="wide")
 
 
-def load_dataset():
-    if os.path.exists(DATA_FILE):
-        df = pd.read_csv(DATA_FILE)
-        return df
-    df = create_seed_dataset()
-    df.to_csv(DATA_FILE, index=False)
+@st.cache_resource
+def load_model():
+    model = joblib.load("model.pkl")
+    vectorizer = joblib.load("vectorizer.pkl")
+    return model, vectorizer
+
+
+def get_hour(time_str):
+    try:
+        return datetime.strptime(str(time_str).strip(), "%I:%M %p").hour
+    except Exception:
+        return 12
+
+
+def predict_scores(df: pd.DataFrame) -> pd.DataFrame:
+    model, vectorizer = load_model()
+
+    df = df.copy()
+    df["ReportText"] = df["ReportText"].fillna("")
+    df["HeelTap"] = df["HeelTap"].fillna(0)
+    df["Hour"] = df["Time"].apply(get_hour)
+
+    X_text = vectorizer.transform(df["ReportText"])
+    X_other = df[["HeelTap", "Hour"]].fillna(0)
+
+    X = hstack([X_text, X_other])
+    preds = model.predict(X).clip(0, 1)
+
+    df["RiskScore"] = preds
     return df
 
 
-def train_model(df):
-    X = df[FEATURE_COLUMNS]
-    y = df["risk_level"]
-    model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=6,
-        random_state=42
-    )
-    model.fit(X, y)
-    joblib.dump(model, MODEL_FILE)
-    return model
+def risk_color(score: float) -> str:
+    if score >= 0.8:
+        return "red"
+    elif score >= 0.55:
+        return "orange"
+    else:
+        return "green"
 
 
-def load_or_train_model(df):
-    if os.path.exists(MODEL_FILE):
-        try:
-            return joblib.load(MODEL_FILE)
-        except Exception:
-            return train_model(df)
-    return train_model(df)
+st.title("SafeStride Incident Risk Heatmap")
+st.write("Zoom in to inspect exact incident locations and click markers for details.")
 
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-def predict_risk(model, event_dict):
-    X = pd.DataFrame([event_dict])[FEATURE_COLUMNS]
-    return model.predict(X)[0]
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
+else:
+    df = pd.read_csv("data.csv")
 
+required_cols = ["Location", "Latitude", "Longitude", "Time", "ReportText", "HeelTap"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns in CSV: {missing}")
+    st.stop()
 
-def append_event(df, model, event_row):
-    predicted_risk = predict_risk(model, event_row)
-    full_row = event_row.copy()
-    full_row["risk_level"] = predicted_risk
+if "RiskScore" not in df.columns:
+    df = predict_scores(df)
 
-    new_df = pd.concat([df, pd.DataFrame([full_row])], ignore_index=True)
-    new_df.to_csv(DATA_FILE, index=False)
+df = df.dropna(subset=["Latitude", "Longitude"]).copy()
+df["RiskScore"] = df["RiskScore"].clip(0, 1)
 
-    new_model = train_model(new_df)
-    return new_df, new_model, predicted_risk
+st.sidebar.header("Filters")
 
+min_score = st.sidebar.slider("Minimum Risk Score", 0.0, 1.0, 0.0, 0.05)
+heel_filter = st.sidebar.selectbox("Heel Tap Filter", ["All", "HeelTap Only", "No HeelTap"])
 
-def build_time_risk_table(df):
-    temp = df.copy()
-    temp["risk_score"] = temp["risk_level"].map(RISK_TO_SCORE)
-    grouped = (
-        temp.groupby("hour", as_index=False)["risk_score"]
-        .mean()
-        .sort_values("hour")
-    )
-    grouped["time_risk"] = grouped["risk_score"].apply(
-        lambda x: "High" if x >= 2.5 else ("Medium" if x >= 1.5 else "Low")
-    )
-    return grouped
+if heel_filter == "HeelTap Only":
+    df = df[df["HeelTap"] == 1]
+elif heel_filter == "No HeelTap":
+    df = df[df["HeelTap"] == 0]
 
+df = df[df["RiskScore"] >= min_score]
 
-def get_summary_counts(df):
-    return {
-        "safe": int((df["risk_level"] == "safe").sum()),
-        "warning": int((df["risk_level"] == "warning").sum()),
-        "emergency": int((df["risk_level"] == "emergency").sum()),
-    }
+if df.empty:
+    st.warning("No incidents match the selected filters.")
+    st.stop()
 
+center_lat = df["Latitude"].mean()
+center_lon = df["Longitude"].mean()
 
-def risk_weight(label):
-    return {"safe": 20, "warning": 60, "emergency": 100}[label]
-
-
-st.set_page_config(page_title="Smart Safety AI Dashboard", layout="wide")
-st.title("Smart Safety AI/ML Real-Time Dashboard")
-
-df = load_dataset()
-model = load_or_train_model(df)
-
-st.sidebar.header("Add New Event")
-
-heel_tap_count = st.sidebar.selectbox("Heel Tap Count", [0, 1, 2, 3], index=0)
-fall_detected = st.sidebar.selectbox("Fall Detected", [0, 1], index=0)
-gps_risk_zone = st.sidebar.selectbox("GPS Risk Zone", [0, 1, 2], index=1)
-battery_low = st.sidebar.selectbox("Battery Low", [0, 1], index=0)
-user_moving_fast = st.sidebar.selectbox("User Moving Fast", [0, 1], index=0)
-hour = st.sidebar.slider("Hour of Day", 0, 23, datetime.now().hour)
-latitude = st.sidebar.number_input("Latitude", value=13.0827, format="%.6f")
-longitude = st.sidebar.number_input("Longitude", value=80.2707, format="%.6f")
-
-is_night = 1 if hour >= 19 or hour <= 5 else 0
-
-new_event = {
-    "heel_tap_count": heel_tap_count,
-    "fall_detected": fall_detected,
-    "gps_risk_zone": gps_risk_zone,
-    "is_night": is_night,
-    "battery_low": battery_low,
-    "user_moving_fast": user_moving_fast,
-    "hour": hour,
-    "latitude": latitude,
-    "longitude": longitude,
-}
-
-if st.sidebar.button("Predict + Add Event"):
-    df, model, predicted_risk = append_event(df, model, new_event)
-    st.sidebar.success(f"Predicted Risk: {predicted_risk.upper()}")
-
-counts = get_summary_counts(df)
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Events", len(df))
-col2.metric("Safe", counts["safe"])
-col3.metric("Warning", counts["warning"])
-col4.metric("Emergency", counts["emergency"])
-
-st.subheader("Latest Events")
-st.dataframe(df.tail(10), use_container_width=True)
-
-st.subheader("Heatmap / Risk Map")
-
-map_df = df.copy()
-map_df["weight"] = map_df["risk_level"].apply(risk_weight)
-
-layer = pdk.Layer(
-    "HeatmapLayer",
-    data=map_df,
-    get_position="[longitude, latitude]",
-    get_weight="weight",
-    radiusPixels=60,
-    intensity=1,
-    threshold=0.2,
+m = folium.Map(
+    location=[center_lat, center_lon],
+    zoom_start=11,
+    tiles="OpenStreetMap"
 )
 
-view_state = pdk.ViewState(
-    latitude=float(map_df["latitude"].mean()),
-    longitude=float(map_df["longitude"].mean()),
-    zoom=11,
-    pitch=40,
-)
+# Heatmap layer
+heat_data = [
+    [row["Latitude"], row["Longitude"], float(row["RiskScore"])]
+    for _, row in df.iterrows()
+]
+HeatMap(
+    heat_data,
+    radius=25,
+    blur=18,
+    max_zoom=17
+).add_to(m)
 
-st.pydeck_chart(pdk.Deck(
-    map_style="mapbox://styles/mapbox/dark-v10",
-    initial_view_state=view_state,
-    layers=[layer],
-))
+# Exact incident markers
+marker_cluster = MarkerCluster(name="Incident Markers").add_to(m)
 
-st.subheader("Time-Based Risk Scores")
-time_risk_df = build_time_risk_table(df)
-st.bar_chart(time_risk_df.set_index("hour")["risk_score"])
-
-st.subheader("Hourly Risk Table")
-st.dataframe(time_risk_df, use_container_width=True)
-
-st.subheader("How this works")
-st.write(
+for _, row in df.iterrows():
+    popup_html = f"""
+    <b>Location:</b> {row['Location']}<br>
+    <b>Time:</b> {row['Time']}<br>
+    <b>HeelTap:</b> {row['HeelTap']}<br>
+    <b>RiskScore:</b> {round(float(row['RiskScore']), 3)}<br>
+    <b>Report:</b> {row['ReportText']}
     """
-- Each new event is added to the dataset.
-- The model retrains on the expanded dataset.
-- The heatmap updates from all stored events.
-- Time-based risk updates from historical event patterns.
-- This makes the demo look live and continuously improving.
-"""
+
+    folium.CircleMarker(
+        location=[row["Latitude"], row["Longitude"]],
+        radius=6,
+        color=risk_color(float(row["RiskScore"])),
+        fill=True,
+        fill_opacity=0.85,
+        popup=folium.Popup(popup_html, max_width=300),
+        tooltip=row["Location"]
+    ).add_to(marker_cluster)
+
+folium.LayerControl().add_to(m)
+
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    map_data = st_folium(m, width=1000, height=650)
+
+with col2:
+    st.subheader("Summary")
+    st.metric("Incidents Shown", len(df))
+    st.metric("Average Risk", round(df["RiskScore"].mean(), 3))
+    st.metric("Heel Taps", int(df["HeelTap"].sum()))
+
+    st.subheader("Top Risk Locations")
+    top_locations = (
+        df.groupby("Location", as_index=False)["RiskScore"]
+        .mean()
+        .sort_values("RiskScore", ascending=False)
+        .head(10)
+    )
+    st.dataframe(top_locations, use_container_width=True)
+
+st.subheader("Incident Table")
+st.dataframe(
+    df[["Location", "Time", "HeelTap", "RiskScore", "ReportText"]],
+    use_container_width=True
 )
